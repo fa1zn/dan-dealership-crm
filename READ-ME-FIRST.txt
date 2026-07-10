@@ -1,0 +1,33 @@
+========================================
+  DAN — your book of business
+========================================
+
+HOW TO START (one-time setup, then it's a double-click):
+
+  Mac:
+    1. If you've never run this before, install Node once:
+       go to https://nodejs.org and click the green LTS button.
+    2. Double-click  START.command
+       (First time, macOS may say "unidentified developer" —
+        right-click START.command, choose Open, then Open again.)
+    3. Your browser opens to Dan. That's it.
+
+  Windows:
+    1. If you've never run this before, install Node once:
+       go to https://nodejs.org and click the green LTS button.
+    2. Double-click  START.bat
+    3. Your browser opens to Dan. That's it.
+
+The first launch takes a couple of minutes (one-time setup).
+After that it opens in a few seconds.
+
+WHILE USING DAN:
+  - Keep the little black terminal window open. Closing it quits Dan.
+  - Dan runs on your computer at  http://localhost:3000
+
+WHAT YOU CAN DO:
+  - Prospect: find dealers to work, filter by brand and area, add them to your worklist.
+  - Book: your dealers, their status, and full detail on each rooftop.
+  - Today: who to call next.
+
+Questions? Contact Faizan.

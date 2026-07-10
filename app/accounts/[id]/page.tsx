@@ -1,0 +1,720 @@
+import Link from "next/link";
+import { notFound } from "next/navigation";
+import { ArrowLeft, ExternalLink, MapPin, Phone, Globe, Mail, Layers, Sparkles, Target, Star, BadgeCheck, AlertTriangle } from "lucide-react";
+import { Card, CardContent, CardHeader, CardTitle, Badge, Button } from "@/components/ui";
+import { CrmPanel, StatusBadge } from "@/components/crm-panel";
+import { LogTouch } from "@/components/log-touch";
+import { InfoTip } from "@/components/info-tip";
+import { getAccount } from "@/lib/queries";
+import { verifyRooftop, type PlacesVerify } from "@/lib/places";
+import { getCrm, getActivity } from "@/lib/crm";
+import { cleanStage } from "@/lib/hubspot";
+import { safeUrl } from "@/lib/url";
+import { computeIntel } from "@/lib/intel";
+import { computePamFit } from "@/lib/pamfit";
+import { SourceTag, contactSource, osmLink, sourceLabel, recordSourceSummary, asOf } from "@/components/source-tag";
+import { Provenance } from "@/components/provenance";
+import { EXPLAIN } from "@/lib/explain";
+
+interface Contact {
+  name?: string;
+  title?: string;
+  email?: string;
+  phone?: string;
+  source?: string;
+}
+
+export const dynamic = "force-dynamic";
+
+function Field({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div className="flex flex-col gap-0.5 py-2">
+      <dt className="text-xs uppercase tracking-wide text-muted-foreground">{label}</dt>
+      <dd className="text-sm">{children ?? <span className="text-muted-foreground">—</span>}</dd>
+    </div>
+  );
+}
+
+/** A value Dan computed/inferred (not fetched from a source). Hover shows exactly that. */
+function Inferred({ children }: { children: React.ReactNode }) {
+  return (
+    <Provenance source="Estimated by Dan" detail="Inferred from other fields, not fetched from a source.">
+      {children}
+    </Provenance>
+  );
+}
+
+/** "checked live just now" is only honest for a fresh fetch; otherwise show the real date
+ *  Google was last called (the value is served from a 30-day cache). */
+function checkedWhen(iso: string | null | undefined): string {
+  if (!iso) return "from Google Places";
+  const d = new Date(iso.includes("T") ? iso : iso.replace(" ", "T") + "Z");
+  if (isNaN(d.getTime())) return "from Google Places";
+  const ageMin = (Date.now() - d.getTime()) / 60000;
+  if (ageMin < 2) return "checked live just now";
+  return "checked " + d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+}
+
+/** A value pulled from Google Places. Hover shows the source and when it was last checked. */
+function FromGoogle({ children, when = "from Google Places" }: { children: React.ReactNode; when?: string }) {
+  return (
+    <Provenance source="Google Places" when={when}>
+      {children}
+    </Provenance>
+  );
+}
+
+function hostOf(url: string): string {
+  try {
+    return new URL(url).hostname.replace(/^www\./, "");
+  } catch {
+    return url;
+  }
+}
+
+/** Live Google-verified facts shown on the briefing hero. Real data, nothing inferred. */
+function VerifiedStrip({ v }: { v: PlacesVerify }) {
+  const closed = v.businessStatus === "CLOSED_PERMANENTLY" || v.businessStatus === "CLOSED_TEMPORARILY";
+  return (
+    <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1.5 text-sm">
+      {v.rating != null && (
+        <span className="inline-flex items-center gap-1 font-medium">
+          <Star className="h-3.5 w-3.5 fill-amber-400 text-amber-400" />
+          <Provenance source="Google Places" when={checkedWhen(v.fetchedAt)}>
+            {v.rating}
+            {v.reviewCount != null && (
+              <span className="font-normal text-muted-foreground"> ({v.reviewCount.toLocaleString()} reviews)</span>
+            )}
+          </Provenance>
+        </span>
+      )}
+      {v.businessStatus &&
+        (closed ? (
+          <span className="inline-flex items-center gap-1 rounded-full bg-red-500/10 px-2 py-0.5 text-xs font-medium text-red-700 dark:text-red-400">
+            <AlertTriangle className="h-3 w-3" />
+            {v.businessStatus === "CLOSED_PERMANENTLY" ? "Permanently closed" : "Temporarily closed"}
+          </span>
+        ) : (
+          <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/10 px-2 py-0.5 text-xs font-medium text-emerald-700 dark:text-emerald-400">
+            <BadgeCheck className="h-3 w-3" /> Open
+          </span>
+        ))}
+      {v.phone && (
+        <Provenance source="Google Places" when={checkedWhen(v.fetchedAt)}>
+          <a href={`tel:${v.phone.replace(/[^\d+]/g, "")}`} className="inline-flex items-center gap-1 text-muted-foreground hover:text-foreground">
+            <Phone className="h-3.5 w-3.5" /> {v.phone}
+          </a>
+        </Provenance>
+      )}
+      <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
+        <BadgeCheck className="h-3 w-3 text-brand" /> Verified on Google
+      </span>
+    </div>
+  );
+}
+
+function Flag({ label, state, okText = "Verified" }: { label: string; state: boolean | null; okText?: string }) {
+  // null = not yet verified (neutral, never alarming); true = verified; false = affirmatively wrong.
+  const v = state == null ? "muted" : state ? "success" : "danger";
+  const text = state == null ? "Not yet verified" : state ? okText : "Invalid";
+  return (
+    <div className="flex items-center justify-between border-b py-2 last:border-0">
+      <span className="text-sm text-muted-foreground">{label}</span>
+      <Badge variant={v as "muted" | "success" | "danger"}>{text}</Badge>
+    </div>
+  );
+}
+
+export default async function AccountDetail({ params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
+  const accountId = Number(id);
+  const a = getAccount(accountId);
+  if (!a) notFound();
+  const crm = getCrm(accountId);
+  const activity = getActivity(accountId);
+  const verified = await verifyRooftop({
+    id: accountId,
+    name: a.name,
+    city: a.city,
+    state: a.state_province,
+    lat: a.latitude,
+    lng: a.longitude,
+  });
+  // 80% of rooftops have no phone on file — Google fills it in. Track the source honestly.
+  const effectivePhone = a.phone || verified?.phone || null;
+  const phoneFromGoogle = !a.phone && !!verified?.phone;
+  let contacts: Contact[] = [];
+  try {
+    contacts = JSON.parse((a as unknown as { contacts?: string }).contacts ?? "[]");
+  } catch {
+    contacts = [];
+  }
+  let tools: string[] = [];
+  try {
+    tools = JSON.parse(a.tools_used ?? "[]");
+  } catch {
+    tools = [];
+  }
+  // Group "Category: Tool" strings by category for display.
+  const toolsByCat = tools.reduce<Record<string, string[]>>((acc, t) => {
+    const [cat, tool] = t.includes(": ") ? t.split(": ") : ["Other", t];
+    (acc[cat] ??= []).push(tool);
+    return acc;
+  }, {});
+  let signals: { rating?: number; reviewCount?: number; hours?: string; socials?: Record<string, string>; emailPattern?: string } = {};
+  try {
+    signals = JSON.parse(a.enrichment ?? "{}");
+  } catch {
+    signals = {};
+  }
+  const techSignals: Array<{ vendor: string; category: string; evidence: string }> =
+    (signals as { techSignals?: Array<{ vendor: string; category: string; evidence: string }> }).techSignals ?? [];
+  const pamAngles: string[] = (signals as { pamAngles?: string[] }).pamAngles ?? [];
+  const hasSignals = !!(signals.rating || signals.hours || signals.emailPattern || (signals.socials && Object.keys(signals.socials).length));
+
+  const intel = computeIntel({
+    contacts,
+    tools,
+    signals,
+    phone: a.phone,
+    phoneValid: a.phone_valid === 1,
+    website: a.website,
+    websiteValid: a.website_valid == null ? null : a.website_valid === 1,
+    brandConfirmed: a.brand_confirmed === 1,
+  });
+  const fit = computePamFit({
+    contacts,
+    tools,
+    signals,
+    phone: a.phone,
+    phoneValid: a.phone_valid === 1,
+    website: a.website,
+    websiteValid: a.website_valid == null ? null : a.website_valid === 1,
+    brandConfirmed: a.brand_confirmed === 1,
+    tier: a.tier,
+  });
+  const fitVariant = fit.band === "Hot" ? "brand" : fit.band === "Warm" ? "secondary" : "outline";
+  const trustTier = (a as unknown as { trust_tier?: string }).trust_tier;
+  const confCount = (a as unknown as { confirmation_count?: number }).confirmation_count ?? 0;
+  const trustVariant =
+    trustTier === "platinum" ? "success" : trustTier === "gold" ? "default" : trustTier === "silver" ? "muted" : "danger";
+
+  const addr = [a.address_street, [a.city, a.state_province].filter(Boolean).join(", "), a.postal_code, a.country]
+    .filter(Boolean)
+    .join(" · ");
+  const hasGeo = a.latitude != null && a.longitude != null;
+  const lat = a.latitude ?? 0;
+  const lng = a.longitude ?? 0;
+  const sources = (a.source ?? "").split("+").filter(Boolean);
+
+  const permClosed = verified?.businessStatus === "CLOSED_PERMANENTLY";
+  const tempClosed = verified?.businessStatus === "CLOSED_TEMPORARILY";
+  const whyCall = permClosed
+    ? "Google lists this rooftop as permanently closed. Confirm it still exists before spending any outreach on it."
+    : tempClosed
+      ? "Google lists this rooftop as temporarily closed. Confirm it is open before calling."
+      : crm.status === "engaged" || crm.status === "won"
+        ? "They responded. Your turn, give them a call."
+        : activity.some((x) => ["call", "sms", "gift"].includes(x.kind))
+          ? "You've reached out. No reply logged yet, worth a personal call."
+          : pamAngles[0]
+            ? pamAngles[0]
+            : "Fresh lead, start with a call.";
+
+  return (
+    <div className="mx-auto max-w-5xl space-y-5">
+      <Link href="/accounts" className="inline-flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground">
+        <ArrowLeft className="h-4 w-4" /> Back to accounts
+      </Link>
+
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <div className="flex items-center gap-2">
+            <h1 className="line-clamp-2 max-w-2xl text-2xl font-semibold tracking-tight">
+              <Provenance source={recordSourceSummary(a.source, a.brand_confirmed)} when={asOf(a.updated_at)}>
+                <span className="enriched-only">{a.name}</span>
+                <span className="raw-only">{(a as unknown as { name_original?: string }).name_original ?? a.name}</span>
+              </Provenance>
+            </h1>
+            <StatusBadge status={crm.status} />
+            {a.tier === "A" ? <Badge variant="brand">Tier A</Badge> : a.tier ? <Badge variant="muted">Tier {a.tier}</Badge> : null}
+            <InfoTip label="Tier">{EXPLAIN.tier}</InfoTip>
+            {trustTier ? (
+              <Badge
+                variant={trustVariant as "success" | "default" | "muted" | "danger"}
+                title={`${confCount} independent source${confCount === 1 ? "" : "s"} confirmed this rooftop`}
+              >
+                {trustTier} · {confCount} confirmation{confCount === 1 ? "" : "s"}
+              </Badge>
+            ) : null}
+            {a.hs_in_crm ? <Badge variant="success">In HubSpot</Badge> : null}
+          </div>
+          <p className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground">
+            <MapPin className="h-3.5 w-3.5" />
+            {addr ? (
+              <Provenance
+                source="OpenStreetMap / dealer record"
+                when={asOf(a.updated_at)}
+                detail={verified?.verifiedAddress ? `Google confirms: ${verified.verifiedAddress}` : undefined}
+              >
+                {addr}
+              </Provenance>
+            ) : (
+              "Address unknown"
+            )}
+          </p>
+          <p className="mt-1 text-xs text-muted-foreground/70">Hover any underlined value to see its source.</p>
+        </div>
+        <div className="flex gap-2">
+          {safeUrl(a.website) && (
+            <Link href={safeUrl(a.website)!} target="_blank">
+              <Button variant="outline" size="sm">
+                <Globe className="h-4 w-4" /> Website <ExternalLink className="h-3 w-3" />
+              </Button>
+            </Link>
+          )}
+          {effectivePhone && (
+            <a
+              href={`tel:${effectivePhone.replace(/[^\d+]/g, "")}`}
+              className={phoneFromGoogle ? "enriched-only" : undefined}
+            >
+              <Button variant="brand" size="sm">
+                <Phone className="h-4 w-4" /> Call
+              </Button>
+            </a>
+          )}
+        </div>
+      </div>
+
+      {(permClosed || tempClosed) && (
+        <div className="flex items-start gap-2 rounded-lg border border-red-500/40 bg-red-500/5 p-3 text-sm text-red-800 dark:text-red-300">
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+          <span>
+            Google lists this rooftop as <span className="font-semibold">{permClosed ? "permanently" : "temporarily"} closed</span>.
+            Confirm it {permClosed ? "still exists" : "is open"} before driving out or spending outreach on it.
+          </span>
+        </div>
+      )}
+
+      {(effectivePhone || verified) && (
+        <div className="rounded-lg border bg-card p-4 sm:p-5">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div className="min-w-0">
+              <div className="text-xs uppercase tracking-wide text-muted-foreground">Why call</div>
+              <p className="mt-1 text-base">{whyCall}</p>
+              {verified && (
+                <div className="enriched-only">
+                  <VerifiedStrip v={verified} />
+                </div>
+              )}
+            </div>
+          </div>
+          {effectivePhone && (
+            <a
+              href={`tel:${effectivePhone.replace(/[^\d+]/g, "")}`}
+              className={`mt-4 inline-flex w-full items-center justify-center gap-2 rounded-lg px-4 py-2.5 text-sm font-medium transition-opacity hover:opacity-90 sm:w-auto${phoneFromGoogle ? " enriched-only" : ""} ${
+                permClosed || tempClosed ? "border text-muted-foreground" : "bg-brand text-brand-foreground"
+              }`}
+            >
+              <Phone className="h-4 w-4" /> {permClosed || tempClosed ? "Call to confirm" : "Call"} {effectivePhone}
+              {phoneFromGoogle && !(permClosed || tempClosed) && (
+                <span className="text-xs font-normal opacity-80">· found on Google</span>
+              )}
+            </a>
+          )}
+        </div>
+      )}
+
+      <div className="flex items-center gap-3 pt-3 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+        More on this dealer
+        <div className="h-px flex-1 bg-border" />
+      </div>
+
+      <Card>
+        <CardHeader className="flex-row items-center justify-between space-y-0 pb-3">
+          <CardTitle className="flex items-center gap-1.5 text-base font-semibold text-foreground">
+            <Sparkles className="h-4 w-4 text-brand" /> Who to call &amp; why
+          </CardTitle>
+          <Badge variant={fitVariant as "brand" | "secondary" | "outline"}>{fit.band} fit</Badge>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="rounded-md border border-brand/30 bg-brand/5 px-3 py-2 text-sm">
+            <span className="font-medium text-brand">Opener:</span> {fit.talkTrack}
+          </div>
+          <div className="grid gap-5 md:grid-cols-2">
+          <div>
+            <div className="flex items-center gap-1.5 text-xs uppercase tracking-wide text-muted-foreground">
+              <Target className="h-3.5 w-3.5" /> Call first
+            </div>
+            {intel.champion ? (
+              <div className="mt-1.5">
+                <div className="font-medium">
+                  {intel.champion.source ? (
+                    <Provenance
+                      source={contactSource(intel.champion.source, a.website).label}
+                      href={contactSource(intel.champion.source, a.website).href}
+                    >
+                      {intel.champion.name}
+                    </Provenance>
+                  ) : (
+                    intel.champion.name
+                  )}
+                </div>
+                <div className="text-sm text-muted-foreground">
+                  {intel.champion.title} · <Inferred>{intel.champion.reason}</Inferred>
+                </div>
+                <div className="mt-1.5 flex flex-wrap gap-3 text-sm">
+                  {(intel.champion.phone ?? a.phone) && (
+                    <a href={`tel:${(intel.champion.phone ?? a.phone)!.replace(/[^\d+]/g, "")}`} className="inline-flex items-center gap-1 text-brand hover:underline">
+                      <Phone className="h-3.5 w-3.5" /> {intel.champion.phone ?? a.phone}
+                    </a>
+                  )}
+                  {intel.champion.email && (
+                    <a href={`mailto:${intel.champion.email}`} className="inline-flex items-center gap-1 text-brand hover:underline">
+                      <Mail className="h-3.5 w-3.5" /> {intel.champion.email}
+                    </a>
+                  )}
+                </div>
+              </div>
+            ) : (
+              <div className="mt-1.5 text-sm text-muted-foreground">
+                No named decision-maker yet — call the main line{a.phone ? ` (${a.phone})` : ""}.
+              </div>
+            )}
+          </div>
+
+          <div>
+            <div className="text-xs uppercase tracking-wide text-muted-foreground">Why call them</div>
+            {intel.whyCall.length ? (
+              <ul className="mt-1.5 space-y-1.5 text-sm">
+                {intel.whyCall.map((w, i) => (
+                  <li key={i} className="flex gap-2">
+                    <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-brand" />
+                    {w.label}
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <div className="mt-1.5 text-sm text-muted-foreground">
+                Nothing jumping out yet — call and find out what they&rsquo;re working with.
+              </div>
+            )}
+          </div>
+          </div>
+        </CardContent>
+      </Card>
+
+      <div className="grid gap-4 lg:grid-cols-3">
+        <Card className="lg:col-span-2">
+          <CardHeader className="flex-row items-center justify-between space-y-0">
+            <CardTitle className="text-base font-semibold text-foreground">Identity & contact</CardTitle>
+            <SourceTag label="OpenStreetMap" href={osmLink(a.latitude, a.longitude)} />
+          </CardHeader>
+          <CardContent>
+            <dl className="grid grid-cols-2 gap-x-8">
+              <Field label="OEM brand">
+                {a.oem ? (
+                  <Provenance
+                    source={a.brand_confirmed === 1 ? `${a.oem} dealer locator` : "OpenStreetMap tag (unconfirmed)"}
+                    when={asOf(a.updated_at)}
+                  >
+                    <Badge variant="muted">{a.oem}</Badge>
+                  </Provenance>
+                ) : null}
+              </Field>
+              <Field label="Dealer group">
+                {a.group_name ? <Inferred>{a.group_name}</Inferred> : null}
+              </Field>
+              <Field label="Group size">{a.group_size ? <Inferred>{a.group_size}</Inferred> : null}</Field>
+              <Field label="Territory">{a.territory ? <Inferred>{a.territory}</Inferred> : null}</Field>
+              <Field label="Website">
+                {a.website ? (
+                  <Provenance source="OpenStreetMap / dealer record" when={asOf(a.updated_at)}>
+                    <a href={safeUrl(a.website)} target="_blank" rel="noreferrer" className="text-primary hover:underline">
+                      {a.domain ?? a.website}
+                    </a>
+                  </Provenance>
+                ) : verified?.website ? (
+                  <span className="enriched-only">
+                    <FromGoogle when={checkedWhen(verified.fetchedAt)}>
+                      <a href={safeUrl(verified.website)} target="_blank" rel="noreferrer" className="text-primary hover:underline">
+                        {hostOf(verified.website)}
+                      </a>
+                    </FromGoogle>
+                  </span>
+                ) : null}
+              </Field>
+              <Field label="Phone">
+                {a.phone ? (
+                  <Provenance source="On file · OpenStreetMap / OEM record" when={asOf(a.updated_at)}>{a.phone}</Provenance>
+                ) : phoneFromGoogle && effectivePhone ? (
+                  <span className="enriched-only">
+                    <FromGoogle when={verified ? checkedWhen(verified.fetchedAt) : undefined}>{effectivePhone}</FromGoogle>
+                  </span>
+                ) : null}
+              </Field>
+              <Field label="Email">
+                {a.email ? (
+                  <a href={`mailto:${a.email}`} className="inline-flex items-center gap-1 text-primary hover:underline">
+                    <Mail className="h-3 w-3" /> {a.email}
+                  </a>
+                ) : null}
+              </Field>
+              <Field label="Coordinates">
+                {hasGeo ? (
+                  <Provenance source="OpenStreetMap" when={asOf(a.updated_at)}>
+                    {`${lat.toFixed(5)}, ${lng.toFixed(5)}`}
+                  </Provenance>
+                ) : null}
+              </Field>
+            </dl>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base font-semibold text-foreground">Validation</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <Flag
+              label="Website"
+              okText={!a.website && verified?.website ? "Verified via Google" : "Verified"}
+              state={
+                a.website ? (a.website_valid == null ? null : a.website_valid === 1) : verified?.website ? true : null
+              }
+            />
+            <Flag
+              label="Phone"
+              okText={!a.phone && verified?.phone ? "Verified via Google" : "Verified"}
+              state={a.phone ? (a.phone_valid === 1 ? true : a.phone_valid === 0 ? false : null) : verified?.phone ? true : null}
+            />
+            {/* Brand is confirmed or simply not-yet-confirmed — never a red "Invalid" on a branded store. */}
+            <Flag label="Brand confirmed" okText="Confirmed" state={a.brand_confirmed === 1 ? true : null} />
+            {verified && (
+              <div className="enriched-only flex items-center justify-between border-b py-2 last:border-0">
+                <span className="text-sm text-muted-foreground">Google listing</span>
+                <Badge variant={verified.businessStatus === "OPERATIONAL" ? "success" : "muted"}>
+                  {verified.businessStatus === "OPERATIONAL" ? "Live · operating" : "Found"}
+                </Badge>
+              </div>
+            )}
+            <div className="mt-3 flex flex-wrap items-center gap-1.5 border-t pt-3">
+              <span className="text-xs text-muted-foreground">Sources:</span>
+              {sources.map((s) => (
+                <Badge key={s} variant="outline">
+                  {sourceLabel(s)}
+                </Badge>
+              ))}
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+
+      <Card className="overflow-hidden">
+        <CardHeader className="flex-row items-center justify-between space-y-0">
+          <CardTitle className="text-base font-semibold text-foreground">Location</CardTitle>
+          <SourceTag label="OpenStreetMap" href={osmLink(a.latitude, a.longitude)} />
+        </CardHeader>
+        <CardContent className="px-0 pb-0">
+          {hasGeo ? (
+            <iframe
+              title="map"
+              className="h-72 w-full border-0"
+              src={`https://www.openstreetmap.org/export/embed.html?bbox=${lng - 0.02}%2C${lat - 0.02}%2C${lng + 0.02}%2C${lat + 0.02}&layer=mapnik&marker=${lat}%2C${lng}`}
+            />
+          ) : (
+            <div className="px-5 pb-5 text-sm text-muted-foreground">No coordinates on file for this rooftop.</div>
+          )}
+        </CardContent>
+      </Card>
+
+      <div className="grid gap-4 lg:grid-cols-3">
+        <div className="space-y-4 lg:col-span-2">
+          <LogTouch id={accountId} />
+          <CrmPanel
+            id={accountId}
+            status={crm.status}
+            owner={crm.owner}
+            nextStep={crm.nextStep}
+            activity={activity}
+          />
+        </div>
+
+        <div className="space-y-4">
+        {(pamAngles.length > 0 || techSignals.length > 0) && (
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-1.5 text-base font-semibold text-foreground">
+                <Sparkles className="h-4 w-4 text-brand" /> Why Pam fits
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              {pamAngles.map((angle, i) => (
+                <p key={i} className="text-sm">
+                  {angle}
+                </p>
+              ))}
+              {techSignals.length > 0 && (
+                <div className="border-t pt-3">
+                  <div className="text-xs uppercase tracking-wide text-muted-foreground">Spotted on their site</div>
+                  <ul className="mt-1.5 space-y-1.5 text-sm">
+                    {techSignals.map((d, i) => (
+                      <li key={i} className="flex flex-wrap items-baseline gap-x-2">
+                        <Provenance
+                          source="Dealer website"
+                          when={asOf(a.updated_at)}
+                          detail={`Matched on their site: "${d.evidence}"`}
+                        >
+                          <span className="font-medium">{d.vendor}</span>
+                        </Provenance>
+                        <span className="text-xs text-muted-foreground">{d.category}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </CardContent>
+          </Card>
+        )}
+        {a.hs_in_crm ? (
+          // Dan-added: matched from the rep's connected HubSpot, not raw source, so hide in Raw view.
+          <Card className="enriched-only border-emerald-500/40">
+            <CardHeader>
+              <CardTitle className="flex items-center gap-1.5 text-base font-semibold text-foreground">
+                <Badge variant="success">In HubSpot</Badge>
+                <InfoTip label="In HubSpot">{EXPLAIN.inHubspot}</InfoTip>
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-2 text-sm">
+              <div className="flex justify-between gap-3">
+                <span className="text-muted-foreground">Lifecycle</span>
+                <Provenance source="Your HubSpot" when={asOf(a.hs_last_activity)}>
+                  <span className="font-medium">{cleanStage(a.hs_lifecycle_stage) ?? "—"}</span>
+                </Provenance>
+              </div>
+              <div className="flex justify-between gap-3">
+                <span className="text-muted-foreground">Owner</span>
+                <Provenance source="Your HubSpot" when={asOf(a.hs_last_activity)}>
+                  <span className="font-medium">{a.hs_owner ?? "Unassigned"}</span>
+                </Provenance>
+              </div>
+              <div className="flex justify-between gap-3">
+                <span className="text-muted-foreground">Last activity</span>
+                <span className="font-medium">{a.hs_last_activity ? a.hs_last_activity.slice(0, 10) : "—"}</span>
+              </div>
+            </CardContent>
+          </Card>
+        ) : null}
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-1.5 text-base font-semibold text-foreground">
+              Contacts <InfoTip label="Contacts">{EXPLAIN.primaryContact}</InfoTip>
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            {contacts.length === 0 ? (
+              <div className="rounded-md border border-dashed p-5 text-center text-sm text-muted-foreground">
+                No names yet — call the main line and ask who runs the sales floor.
+              </div>
+            ) : (
+              <ul className="space-y-3">
+                {contacts.map((c, i) => (
+                  <li key={i} className="border-b pb-3 last:border-0">
+                    <div className="text-sm font-medium">{c.name ?? c.email ?? "Contact"}</div>
+                    {c.title && <div className="text-xs text-muted-foreground">{c.title}</div>}
+                    {c.email && (
+                      <a href={`mailto:${c.email}`} className="text-xs text-primary hover:underline">
+                        {c.email}
+                      </a>
+                    )}
+                    {c.phone && <div className="text-xs text-muted-foreground">{c.phone}</div>}
+                    {c.source && (
+                      <div className="mt-1">
+                        <SourceTag {...contactSource(c.source, a.website)} />
+                      </div>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </CardContent>
+        </Card>
+
+        {tools.length > 0 && (
+          <Card>
+            <CardHeader className="flex-row items-center justify-between space-y-0">
+              <CardTitle className="flex items-center gap-1.5 text-base font-semibold text-foreground">
+                <Layers className="h-4 w-4 text-brand" /> Tech stack
+                <InfoTip label="Tech stack">{EXPLAIN.tools}</InfoTip>
+              </CardTitle>
+              <SourceTag label={`${a.domain ?? "dealer site"} · scripts`} href={a.website} />
+            </CardHeader>
+            <CardContent className="space-y-3">
+              {Object.entries(toolsByCat).map(([cat, list]) => (
+                <div key={cat}>
+                  <div className="text-xs uppercase tracking-wide text-muted-foreground">{cat}</div>
+                  <div className="mt-1 flex flex-wrap gap-1.5">
+                    {list.map((t) => (
+                      <Badge key={t} variant="secondary">
+                        {t}
+                      </Badge>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </CardContent>
+          </Card>
+        )}
+
+        {hasSignals && (
+          <Card>
+            <CardHeader className="flex-row items-center justify-between space-y-0">
+              <CardTitle className="text-base font-semibold text-foreground">Signals</CardTitle>
+              <SourceTag label={`${a.domain ?? "dealer site"} · schema.org`} href={a.website} />
+            </CardHeader>
+            <CardContent className="space-y-2 text-sm">
+              {signals.rating ? (
+                <div className="flex justify-between gap-3">
+                  <span className="text-muted-foreground">Rating</span>
+                  <span className="font-medium">
+                    ★{" "}
+                    <Provenance source="Dealer website (schema.org)" when={asOf(a.updated_at)}>
+                      {signals.rating}
+                      {signals.reviewCount ? (
+                        <span className="text-muted-foreground"> ({signals.reviewCount} reviews)</span>
+                      ) : null}
+                    </Provenance>
+                  </span>
+                </div>
+              ) : null}
+              {signals.hours ? (
+                <div className="flex justify-between gap-3">
+                  <span className="shrink-0 text-muted-foreground">Hours</span>
+                  <span className="text-right font-medium">{signals.hours}</span>
+                </div>
+              ) : null}
+              {signals.emailPattern ? (
+                <div className="flex justify-between gap-3">
+                  <span className="text-muted-foreground">Email pattern</span>
+                  <code className="font-medium">{signals.emailPattern}</code>
+                </div>
+              ) : null}
+              {signals.socials && Object.keys(signals.socials).length ? (
+                <div className="flex flex-wrap gap-1.5 pt-1">
+                  {Object.entries(signals.socials).map(([k, u]) => (
+                    <a key={k} href={safeUrl(u)} target="_blank" rel="noreferrer">
+                      <Badge variant="outline" className="capitalize hover:bg-accent">
+                        {k}
+                      </Badge>
+                    </a>
+                  ))}
+                </div>
+              ) : null}
+            </CardContent>
+          </Card>
+        )}
+        </div>
+      </div>
+    </div>
+  );
+}
