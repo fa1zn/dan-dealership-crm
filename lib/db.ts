@@ -56,6 +56,12 @@ export function getSqlite(): Database.Database {
     CREATE INDEX IF NOT EXISTS dealerships_oem_idx ON dealerships(oem);
     CREATE INDEX IF NOT EXISTS dealerships_country_idx ON dealerships(country);
     CREATE INDEX IF NOT EXISTS dealerships_domain_idx ON dealerships(domain);
+    -- Filter/facet/sort hot paths (Prospect + Book). Without these, filtering or sorting by
+    -- state does a full scan of 34k rows (~135ms); with them it's sub-millisecond.
+    CREATE INDEX IF NOT EXISTS d_state_idx ON dealerships(state_province);
+    CREATE INDEX IF NOT EXISTS d_city_idx ON dealerships(city);
+    CREATE INDEX IF NOT EXISTS d_oem_state_city_idx ON dealerships(oem, state_province, city);
+    CREATE INDEX IF NOT EXISTS d_state_name_idx ON dealerships(state_province, name);
 
     -- Phase 3 CRM: the sales state Dan layers on top of each rooftop.
     CREATE TABLE IF NOT EXISTS account_crm (
